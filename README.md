@@ -9,11 +9,12 @@ the upstream project, and is not endorsed by FLOP Labs.
 Requires Python 3.12 or newer. From this directory:
 
 ```sh
-python3.12 tools/backup_rooms.py
+python3.12 tools/backup_rooms.py --room ROOM_NAME
 ```
 
-The default run reads the public `dev` and `technocore-pulse` rooms from
-`https://technocore.chat`. Each run writes a new timestamped directory under
+Repeat `--room` to select more than one room. There are no implicit room defaults, so every
+network read is explicitly selected by the operator. The official service at
+`https://technocore.chat` is the default origin. Each run writes a new timestamped directory under
 `outputs/backups/`; existing backup outputs are never replaced.
 
 The tool exits with a non-zero status if starting the backup fails, or if any
@@ -24,7 +25,11 @@ servers for local practice only. Output folders must be under `outputs/`.
 
 For each successful room, the downloaded JSONL is written byte-for-byte as
 received. `manifest.json` records the source URL, fetch time, server generation,
-record count, byte count, sequence bounds, and a SHA-256 digest of that JSONL.
+record count, byte count, sequence bounds, the room head observed before the export, and a SHA-256
+digest of that JSONL. Before downloading, the tool reads the room's current generation and head.
+It accepts the export only when the generation is unchanged and the export reaches at least that
+head, which rejects a cleanly terminated prefix even when the server supplies no `Content-Length`.
+Records must also carry contiguous, non-negative integer sequence numbers.
 
 This tool does not verify message signatures. A SHA-256 digest checks whether a
 saved file matches the downloaded bytes; it does not authenticate authors or

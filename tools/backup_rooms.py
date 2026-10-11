@@ -11,17 +11,18 @@ import os
 import re
 import sys
 import tempfile
+import time
 from datetime import UTC, datetime
 from http.client import HTTPException
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 DEFAULT_BASE_URL = "https://technocore.chat"
-DEFAULT_ROOMS = ("dev", "technocore-pulse")
 MAX_EXPORT_BYTES = 16 * 1024 * 1024
+MAX_HEAD_BYTES = 256 * 1024
 REQUEST_TIMEOUT_SECONDS = 20
 ROOM_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
 WORKSPACE = Path(__file__).resolve().parents[1]
@@ -41,7 +42,7 @@ class _RejectRedirects(HTTPRedirectHandler):
 
 def validate_room(room: str) -> str:
     if not ROOM_NAME.fullmatch(room):
-        raise BackupError("방 이름이 올바르지 않습니다: " + repr(room))
+        raise BackupError("Invalid room name: " + repr(room))
     return room
 
 
@@ -50,25 +51,23 @@ def validate_base_url(base_url: str) -> str:
         parsed = urlsplit(base_url)
         port = parsed.port
     except ValueError as exc:
-        raise BackupError("서버 주소 형식이 올바르지 않습니다.") from exc
+        raise BackupError("Invalid server URL.") from exc
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise BackupError("서버 주소 형식이 올바르지 않습니다.")
+        raise BackupError("Invalid server URL.")
     if parsed.path not in ("", "/"):
-        raise BackupError("서버 주소에는 경로를 넣을 수 없습니다.")
+        raise BackupError("The server URL must not contain a path.")
     host = parsed.hostname
     if not host:
-        raise BackupError("서버 주소에 호스트가 없습니다.")
+        raise BackupError("The server URL has no host.")
     if parsed.scheme == "https" and host.lower() == "technocore.chat":
         if port not in (None, 443):
-            raise BackupError("공식 서버는 기본 HTTPS 포트만 사용할 수 있습니다.")
+            raise BackupError("The official server must use the default HTTPS port.")
         return DEFAULT_BASE_URL
     if parsed.scheme == "http" and _is_loopback(host):
         if port is None:
-            raise BackupError("연습용 로컬 서버 포트가 필요합니다.")
+            raise BackupError("A loopback practice server needs an explicit port.")
         return base_url.rstrip("/")
-    raise BackupError(
-        "공식 HTTPS 서버 또는 연습용 로컬 HTTP 서버만 사용할 수 있습니다."
-    )
+    raise BackupError("Use the official HTTPS server or a loopback HTTP practice server.")
 
 
 def _is_loopback(host: str) -> bool:
@@ -88,10 +87,10 @@ def validate_backup_root(backup_root: Path, outputs_dir: Path = OUTPUTS_DIR) -> 
         root.relative_to(allowed)
     except ValueError as exc:
         raise BackupError(
-            "백업 위치는 이 작업 폴더의 outputs 안에 있어야 합니다."
+            "The backup location must be inside this workspace's outputs directory."
         ) from exc
     if root == allowed:
-        raise BackupError("백업 위치는 outputs 안의 전용 폴더여야 합니다.")
+        raise BackupError("Choose a dedicated folder inside outputs for backups.")
     return root
 
 
@@ -107,38 +106,72 @@ def make_backup_directory(backup_root: Path) -> Path:
             return candidate
         except FileExistsError:
             continue
-    raise BackupError("새 백업 폴더를 만들 수 없습니다. 잠시 후 다시 시도해 주세요.")
+    raise BackupError("Could not create a unique backup folder; try again later.")
 
 
 def _parse_export(data: bytes) -> tuple[int, int | None, int | None]:
     if not data:
         return 0, None, None
     if not data.endswith(b"\n"):
-        raise BackupError("내보내기 데이터의 마지막 줄이 완전하지 않습니다.")
+        raise BackupError("The export ends with an incomplete line.")
     first_seq: int | None = None
     last_seq: int | None = None
     count = 0
     for line_number, line in enumerate(data.splitlines(), start=1):
         if not line:
-            raise BackupError(f"내보내기 {line_number}번째 줄이 비어 있습니다.")
+            raise BackupError(f"Export line {line_number} is empty.")
         try:
             record = json.loads(line.decode("utf-8"), parse_int=int)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise BackupError(
-                f"내보내기 {line_number}번째 줄이 올바른 JSON이 아닙니다."
-            ) from exc
+            raise BackupError(f"Export line {line_number} is not valid JSON.") from exc
         if (
             not isinstance(record, dict)
             or not isinstance(record.get("seq"), int)
             or isinstance(record["seq"], bool)
         ):
-            raise BackupError(f"내보내기 {line_number}번째 줄에 정수 seq가 없습니다.")
+            raise BackupError(f"Export line {line_number} has no integer seq.")
         seq = record["seq"]
+        if seq < 0 or (last_seq is not None and seq != last_seq + 1):
+            raise BackupError(f"Export line {line_number} is not the next contiguous sequence.")
         if first_seq is None:
             first_seq = seq
         last_seq = seq
         count += 1
     return count, first_seq, last_seq
+
+
+def _read_head(base_url: str, room: str) -> tuple[int, str]:
+    query = urlencode({"format": "json", "limit": 1, "n": time.time_ns()})
+    url = f"{base_url}/r/{quote(room, safe='')}?{query}"
+    request = Request(
+        url, headers={"Accept": "application/json", "User-Agent": "technocore-room-backup/1"}
+    )
+    try:
+        opener = build_opener(_RejectRedirects())
+        with opener.open(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+            if response.status != 200:
+                raise BackupError(f"The server returned HTTP {response.status}.")
+            data = response.read(MAX_HEAD_BYTES + 1)
+            if len(data) > MAX_HEAD_BYTES:
+                raise BackupError("The room-head response exceeds 256 KiB.")
+    except HTTPError as exc:
+        raise BackupError(f"The server returned HTTP {exc.code}.") from exc
+    except (HTTPException, URLError, TimeoutError, OSError) as exc:
+        detail = exc.reason if isinstance(exc, URLError) else exc
+        raise BackupError(f"Could not read the room head: {detail}") from exc
+    try:
+        view = json.loads(data.decode("utf-8"), parse_int=int)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BackupError("The room-head response is not valid JSON.") from exc
+    last_seq = view.get("last_seq") if isinstance(view, dict) else None
+    generation = view.get("generation") if isinstance(view, dict) else None
+    if not isinstance(last_seq, int) or isinstance(last_seq, bool) or last_seq < 0:
+        raise BackupError("The room-head response has no non-negative integer last_seq.")
+    if isinstance(generation, int) and not isinstance(generation, bool) and generation >= 0:
+        generation = str(generation)
+    if not isinstance(generation, str) or not generation:
+        raise BackupError("The room-head response has no generation.")
+    return last_seq, generation
 
 
 def _read_export(url: str) -> tuple[bytes, str]:
@@ -153,17 +186,17 @@ def _read_export(url: str) -> tuple[bytes, str]:
         opener = build_opener(_RejectRedirects())
         with opener.open(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
             if response.status != 200:
-                raise BackupError(f"서버가 HTTP {response.status} 응답을 보냈습니다.")
+                raise BackupError(f"The server returned HTTP {response.status}.")
             content_length = response.headers.get("Content-Length")
             if (
                 content_length
                 and content_length.isdigit()
                 and int(content_length) > MAX_EXPORT_BYTES
             ):
-                raise BackupError("내보내기 데이터가 16MiB 제한보다 큽니다.")
+                raise BackupError("The export exceeds the 16 MiB client limit.")
             generation = response.headers.get("X-Room-Generation")
             if generation is None:
-                raise BackupError("응답에 X-Room-Generation 헤더가 없습니다.")
+                raise BackupError("The export has no X-Room-Generation header.")
             chunks: list[bytes] = []
             total = 0
             while True:
@@ -172,23 +205,17 @@ def _read_export(url: str) -> tuple[bytes, str]:
                     break
                 total += len(chunk)
                 if total > MAX_EXPORT_BYTES:
-                    raise BackupError("내보내기 데이터가 16MiB 제한보다 큽니다.")
+                    raise BackupError("The export exceeds the 16 MiB client limit.")
                 chunks.append(chunk)
             data = b"".join(chunks)
-            if (
-                content_length
-                and content_length.isdigit()
-                and len(data) != int(content_length)
-            ):
-                raise BackupError(
-                    "내보내기 데이터가 Content-Length보다 짧아 중간에 끊겼습니다."
-                )
+            if content_length and content_length.isdigit() and len(data) != int(content_length):
+                raise BackupError("The export ended before its declared Content-Length.")
             return data, generation
     except HTTPError as exc:
-        raise BackupError(f"서버가 HTTP {exc.code} 오류를 보냈습니다.") from exc
+        raise BackupError(f"The server returned HTTP {exc.code}.") from exc
     except (HTTPException, URLError, TimeoutError, OSError) as exc:
         raise BackupError(
-            f"서버에 연결하지 못했습니다: {exc.reason if isinstance(exc, URLError) else exc}"
+            f"Could not read the export: {exc.reason if isinstance(exc, URLError) else exc}"
         ) from exc
 
 
@@ -209,7 +236,7 @@ def _atomic_write(path: Path, data: bytes) -> None:
 
 
 def backup_rooms(
-    rooms: tuple[str, ...] = DEFAULT_ROOMS,
+    rooms: tuple[str, ...],
     base_url: str = DEFAULT_BASE_URL,
     backup_root: Path | None = None,
     *,
@@ -219,9 +246,9 @@ def backup_rooms(
     base_url = validate_base_url(base_url)
     checked_rooms = tuple(validate_room(room) for room in rooms)
     if not checked_rooms:
-        raise BackupError("백업할 방이 없습니다.")
+        raise BackupError("At least one --room is required.")
     if len(set(checked_rooms)) != len(checked_rooms):
-        raise BackupError("같은 방을 두 번 백업하도록 지정할 수 없습니다.")
+        raise BackupError("A room may be selected only once.")
     root = validate_backup_root(backup_root or outputs_dir / "backups", outputs_dir)
     destination = make_backup_directory(root)
     results: list[dict[str, Any]] = []
@@ -229,8 +256,16 @@ def backup_rooms(
         source_url = f"{base_url}/r/{quote(room, safe='')}/export"
         fetched_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
         try:
+            head_seq, head_generation = _read_head(base_url, room)
             data, generation = _read_export(source_url)
+            if generation != head_generation:
+                raise BackupError("The room generation changed between the head read and export.")
             record_count, first_seq, last_seq = _parse_export(data)
+            if last_seq is None:
+                if head_seq != 0:
+                    raise BackupError("The export is empty but the room head is not.")
+            elif last_seq < head_seq:
+                raise BackupError("The export ended before the room head captured before download.")
             file_name = f"{room}.jsonl"
             _atomic_write(destination / file_name, data)
             results.append(
@@ -241,6 +276,7 @@ def backup_rooms(
                     "source_url": source_url,
                     "fetched_at": fetched_at,
                     "generation": generation,
+                    "head_seq_before_export": head_seq,
                     "sha256": hashlib.sha256(data).hexdigest(),
                     "bytes": len(data),
                     "record_count": record_count,
@@ -274,31 +310,29 @@ def backup_rooms(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Technocore 방의 보존된 대화를 읽기 전용으로 백업합니다."
+        description="Back up retained Technocore room exports without writing to the service."
     )
     parser.add_argument(
-        "--base-url", default=DEFAULT_BASE_URL, help="기본값: 공식 Technocore 서버"
+        "--base-url", default=DEFAULT_BASE_URL, help="server URL (default: official service)"
     )
     parser.add_argument(
-        "--room", action="append", help="백업할 방 이름 (여러 번 지정 가능)"
+        "--room", action="append", required=True, help="room to back up (repeatable)"
     )
-    parser.add_argument("--output-dir", type=Path, help="outputs 안의 백업 폴더")
+    parser.add_argument("--output-dir", type=Path, help="dedicated backup folder under outputs")
     args = parser.parse_args(argv)
     try:
-        destination, results = backup_rooms(
-            tuple(args.room or DEFAULT_ROOMS), args.base_url, args.output_dir
-        )
+        destination, results = backup_rooms(tuple(args.room), args.base_url, args.output_dir)
     except (BackupError, OSError) as exc:
-        print("백업을 시작할 수 없습니다:", exc, file=sys.stderr)
+        print("Could not start backup:", exc, file=sys.stderr)
         return 2
     succeeded = [item for item in results if item["status"] == "success"]
     failed = [item for item in results if item["status"] == "failed"]
-    print(f"백업 폴더: {destination}")
+    print(f"Backup folder: {destination}")
     for item in succeeded:
-        print(f"완료: {item['room']} ({item['record_count']}개 기록)")
+        print(f"Complete: {item['room']} ({item['record_count']} records)")
     for item in failed:
-        print(f"실패: {item['room']} — {item['error']}", file=sys.stderr)
-    print("기록: manifest.json")
+        print(f"Failed: {item['room']} — {item['error']}", file=sys.stderr)
+    print("Manifest: manifest.json")
     return 1 if failed else 0
 
 

@@ -6,6 +6,7 @@ import threading
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -23,10 +24,45 @@ class LocalHTTPServer(HTTPServer):
 
 
 @contextmanager
-def fake_server(responses: dict[str, tuple[int, dict[str, str], bytes]]):
+def fake_server(
+    responses: dict[str, tuple[int, dict[str, str], bytes]],
+    *,
+    head_overrides: dict[str, tuple[int, str]] | None = None,
+):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
-            status, headers, body = responses.get(self.path, (404, {}, b"missing"))
+            parsed = urlsplit(self.path)
+            query = parse_qs(parsed.query)
+            if query.get("format") == ["json"] and query.get("limit") == ["1"]:
+                room = parsed.path.removeprefix("/r/")
+                export_status, export_headers, export_body = responses.get(
+                    f"/r/{room}/export", (404, {}, b"")
+                )
+                seqs = []
+                for line in export_body.splitlines():
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(record, dict) and isinstance(record.get("seq"), int):
+                        seqs.append(record["seq"])
+                last_seq, generation = (head_overrides or {}).get(
+                    room,
+                    (
+                        max(seqs, default=0),
+                        export_headers.get("X-Room-Generation", "1"),
+                    ),
+                )
+                json_generation = int(generation) if generation.isdigit() else generation
+                status, headers, body = (
+                    200 if export_status != 404 else 404,
+                    {"Content-Type": "application/json"},
+                    json.dumps(
+                        {"last_seq": last_seq, "generation": json_generation, "messages": []}
+                    ).encode(),
+                )
+            else:
+                status, headers, body = responses.get(parsed.path, (404, {}, b"missing"))
             self.send_response(status)
             if "Content-Length" not in headers:
                 self.send_header("Content-Length", str(len(body)))
@@ -87,10 +123,7 @@ def test_http_failure_is_recorded_without_a_data_file(tmp_path: Path) -> None:
     assert results[0]["status"] == "failed"
     assert "HTTP 503" in results[0]["error"]
     assert not (destination / "dev.jsonl").exists()
-    assert (
-        json.loads((destination / "manifest.json").read_text())["rooms"][0]["status"]
-        == "failed"
-    )
+    assert json.loads((destination / "manifest.json").read_text())["rooms"][0]["status"] == "failed"
 
 
 def test_redirect_is_rejected_before_it_can_reach_another_route(tmp_path: Path) -> None:
@@ -131,9 +164,7 @@ def test_invalid_jsonl_is_not_saved(tmp_path: Path, body: bytes) -> None:
 
 def test_blank_export_is_saved_as_an_empty_valid_backup(tmp_path: Path) -> None:
     root, outputs = backup_root(tmp_path)
-    with fake_server(
-        {"/r/dev/export": (200, {"X-Room-Generation": "1"}, b"")}
-    ) as base_url:
+    with fake_server({"/r/dev/export": (200, {"X-Room-Generation": "1"}, b"")}) as base_url:
         destination, results = backup_rooms.backup_rooms(
             ("dev",), base_url, root, outputs_dir=outputs
         )
@@ -159,12 +190,8 @@ def test_repeated_backups_use_different_folders(tmp_path: Path) -> None:
     root, outputs = backup_root(tmp_path)
     response = {"/r/dev/export": (200, {"X-Room-Generation": "1"}, b'{"seq":1}\n')}
     with fake_server(response) as base_url:
-        first, _ = backup_rooms.backup_rooms(
-            ("dev",), base_url, root, outputs_dir=outputs
-        )
-        second, _ = backup_rooms.backup_rooms(
-            ("dev",), base_url, root, outputs_dir=outputs
-        )
+        first, _ = backup_rooms.backup_rooms(("dev",), base_url, root, outputs_dir=outputs)
+        second, _ = backup_rooms.backup_rooms(("dev",), base_url, root, outputs_dir=outputs)
 
     assert first != second
     assert (first / "dev.jsonl").read_bytes() == (second / "dev.jsonl").read_bytes()
@@ -172,7 +199,7 @@ def test_repeated_backups_use_different_folders(tmp_path: Path) -> None:
 
 def test_duplicate_room_is_rejected_before_creating_a_folder(tmp_path: Path) -> None:
     root, outputs = backup_root(tmp_path)
-    with pytest.raises(backup_rooms.BackupError, match="두 번"):
+    with pytest.raises(backup_rooms.BackupError, match="only once"):
         backup_rooms.backup_rooms(("dev", "dev"), backup_root=root, outputs_dir=outputs)
     assert not root.exists()
 
@@ -209,13 +236,57 @@ def test_invalid_room_is_rejected(room: str) -> None:
 def test_only_official_or_loopback_server_and_safe_output_are_allowed(
     tmp_path: Path,
 ) -> None:
-    assert (
-        backup_rooms.validate_base_url("https://technocore.chat/")
-        == "https://technocore.chat"
-    )
+    assert backup_rooms.validate_base_url("https://technocore.chat/") == "https://technocore.chat"
     with pytest.raises(backup_rooms.BackupError):
         backup_rooms.validate_base_url("http://example.test:8080")
     with pytest.raises(backup_rooms.BackupError):
         backup_rooms.validate_base_url("http://127.0.0.1:not-a-port")
     with pytest.raises(backup_rooms.BackupError):
         backup_rooms.validate_backup_root(tmp_path / "outside", tmp_path / "outputs")
+
+
+def test_clean_export_prefix_is_rejected_against_preflight_head(tmp_path: Path) -> None:
+    root, outputs = backup_root(tmp_path)
+    response = {"/r/dev/export": (200, {"X-Room-Generation": "1"}, b'{"seq":1}\n')}
+    with fake_server(response, head_overrides={"dev": (2, "1")}) as base_url:
+        destination, results = backup_rooms.backup_rooms(
+            ("dev",), base_url, root, outputs_dir=outputs
+        )
+
+    assert results[0]["status"] == "failed"
+    assert "ended before the room head" in results[0]["error"]
+    assert not (destination / "dev.jsonl").exists()
+
+
+def test_generation_change_during_export_is_rejected(tmp_path: Path) -> None:
+    root, outputs = backup_root(tmp_path)
+    response = {"/r/dev/export": (200, {"X-Room-Generation": "2"}, b'{"seq":1}\n')}
+    with fake_server(response, head_overrides={"dev": (0, "1")}) as base_url:
+        destination, results = backup_rooms.backup_rooms(
+            ("dev",), base_url, root, outputs_dir=outputs
+        )
+
+    assert results[0]["status"] == "failed"
+    assert "generation changed" in results[0]["error"]
+    assert not (destination / "dev.jsonl").exists()
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"seq":1}\n{"seq":3}\n',
+        b'{"seq":2}\n{"seq":2}\n',
+        b'{"seq":-1}\n',
+    ],
+)
+def test_noncontiguous_or_negative_sequences_are_rejected(tmp_path: Path, body: bytes) -> None:
+    root, outputs = backup_root(tmp_path)
+    response = {"/r/dev/export": (200, {"X-Room-Generation": "1"}, body)}
+    with fake_server(response, head_overrides={"dev": (0, "1")}) as base_url:
+        destination, results = backup_rooms.backup_rooms(
+            ("dev",), base_url, root, outputs_dir=outputs
+        )
+
+    assert results[0]["status"] == "failed"
+    assert "contiguous sequence" in results[0]["error"]
+    assert not (destination / "dev.jsonl").exists()
