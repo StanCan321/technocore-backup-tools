@@ -28,6 +28,7 @@ def fake_server(
     responses: dict[str, tuple[int, dict[str, str], bytes]],
     *,
     head_overrides: dict[str, tuple[int, str]] | None = None,
+    add_content_length: bool = True,
 ):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -64,7 +65,7 @@ def fake_server(
             else:
                 status, headers, body = responses.get(parsed.path, (404, {}, b"missing"))
             self.send_response(status)
-            if "Content-Length" not in headers:
+            if add_content_length and "Content-Length" not in headers:
                 self.send_header("Content-Length", str(len(body)))
             for name, value in headers.items():
                 self.send_header(name, value)
@@ -110,6 +111,7 @@ def test_backup_preserves_exact_jsonl_and_large_nonce(tmp_path: Path) -> None:
     assert result["first_seq"] == 1
     assert result["last_seq"] == 2
     assert manifest["rooms"][0]["generation"] == "epoch-7"
+    assert manifest["rooms"][0]["head_seq_before_export"] == 2
     assert json.loads(body.splitlines()[1])["nonce"] == 9999999999999999999
 
 
@@ -256,6 +258,53 @@ def test_clean_export_prefix_is_rejected_against_preflight_head(tmp_path: Path) 
     assert results[0]["status"] == "failed"
     assert "ended before the room head" in results[0]["error"]
     assert not (destination / "dev.jsonl").exists()
+
+
+def test_clean_export_prefix_without_content_length_is_rejected(tmp_path: Path) -> None:
+    root, outputs = backup_root(tmp_path)
+    response = {"/r/dev/export": (200, {"X-Room-Generation": "1"}, b'{"seq":1}\n')}
+    with fake_server(
+        response,
+        head_overrides={"dev": (2, "1")},
+        add_content_length=False,
+    ) as base_url:
+        destination, results = backup_rooms.backup_rooms(
+            ("dev",), base_url, root, outputs_dir=outputs
+        )
+
+    assert results[0]["status"] == "failed"
+    assert "ended before the room head" in results[0]["error"]
+    assert not (destination / "dev.jsonl").exists()
+
+
+def test_concurrent_append_after_preflight_head_is_accepted(tmp_path: Path) -> None:
+    root, outputs = backup_root(tmp_path)
+    body = b'{"seq":1}\n{"seq":2}\n{"seq":3}\n'
+    response = {"/r/dev/export": (200, {"X-Room-Generation": "1"}, body)}
+    with fake_server(response, head_overrides={"dev": (2, "1")}) as base_url:
+        destination, results = backup_rooms.backup_rooms(
+            ("dev",), base_url, root, outputs_dir=outputs
+        )
+
+    assert results[0]["status"] == "success"
+    assert results[0]["head_seq_before_export"] == 2
+    assert results[0]["last_seq"] == 3
+    assert (destination / "dev.jsonl").read_bytes() == body
+
+
+def test_retained_export_may_start_above_one(tmp_path: Path) -> None:
+    root, outputs = backup_root(tmp_path)
+    body = b'{"seq":5}\n{"seq":6}\n'
+    response = {"/r/dev/export": (200, {"X-Room-Generation": "1"}, body)}
+    with fake_server(response, head_overrides={"dev": (6, "1")}) as base_url:
+        destination, results = backup_rooms.backup_rooms(
+            ("dev",), base_url, root, outputs_dir=outputs
+        )
+
+    assert results[0]["status"] == "success"
+    assert results[0]["first_seq"] == 5
+    assert results[0]["last_seq"] == 6
+    assert (destination / "dev.jsonl").read_bytes() == body
 
 
 def test_generation_change_during_export_is_rejected(tmp_path: Path) -> None:

@@ -29,7 +29,9 @@ record count, byte count, sequence bounds, the room head observed before the exp
 digest of that JSONL. Before downloading, the tool reads the room's current generation and head.
 It accepts the export only when the generation is unchanged and the export reaches at least that
 head, which rejects a cleanly terminated prefix even when the server supplies no `Content-Length`.
-Records must also carry contiguous, non-negative integer sequence numbers.
+This proves delivery through the head captured before the export began; messages appended during
+the download may or may not be present in that snapshot. Records must also carry contiguous,
+non-negative integer sequence numbers.
 
 This tool does not verify message signatures. A SHA-256 digest checks whether a
 saved file matches the downloaded bytes; it does not authenticate authors or
